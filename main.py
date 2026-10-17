@@ -11,6 +11,7 @@ Plati.market (Digiseller) -> Telegram: уведомления о новых за
 
 import hashlib
 import html
+import json
 import logging
 import os
 import time
@@ -53,7 +54,8 @@ def get_token(force=False):
 
 def last_sales(top=20):
     r = http.get(f"{API}/seller-last-sales",
-                 params={"token": get_token(), "seller_id": SELLER_ID, "top": top}, timeout=20)
+                 params={"token": get_token(), "seller_id": SELLER_ID, "top": top,
+                         "group": "false"}, timeout=20)  # без группировки по товару
     data = r.json()
     if data.get("retval") != 0:
         get_token(force=True)
@@ -62,27 +64,62 @@ def last_sales(top=20):
 
 
 def purchase_info(invoice_id):
-    r = http.get(f"{API}/purchase/info/{invoice_id}", params={"token": get_token()}, timeout=20)
-    data = r.json()
-    return data.get("content") or {} if data.get("retval") == 0 else {}
+    """Подробности заказа. Если не получилось — не страшно, отправим то, что есть."""
+    try:
+        r = http.get(f"{API}/purchase/info/{invoice_id}", params={"token": get_token()}, timeout=20)
+        data = r.json()
+        if data.get("retval") == 0:
+            return data.get("content") or {}
+        log.warning("purchase/info %s: %s", invoice_id, data)
+    except Exception as ex:
+        log.warning("purchase/info %s: %s", invoice_id, ex)
+    return {}
 
 
 def send_tg(text):
-    r = http.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                  json={"chat_id": TG_CHAT, "text": text, "parse_mode": "HTML",
-                        "disable_web_page_preview": True}, timeout=20)
+    """Возвращает True, если сообщение дошло до Telegram."""
+    try:
+        r = http.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                      json={"chat_id": TG_CHAT, "text": text, "parse_mode": "HTML",
+                            "disable_web_page_preview": True}, timeout=20)
+    except Exception as ex:
+        log.error("Telegram: %s", ex)
+        return False
     if not r.ok:
         log.error("Telegram: %s", r.text)
-    else:
-        log.info("Telegram: сообщение отправлено")
+        return False
+    log.info("Telegram: сообщение отправлено")
+    return True
+
+
+ID_FIELDS = ("invoice_id", "inv", "id_invoice", "invoiceId", "invoice", "id_i", "unique_code", "id")
+
+
+def sale_inv(sale):
+    """Номер заказа — Plati в разных режимах называет это поле по-разному."""
+    for f in ID_FIELDS:
+        v = sale.get(f)
+        if v not in (None, "", 0):
+            return v
+    return None
+
+
+def sale_key(sale):
+    """Уникальный ключ продажи: номер заказа, а если его нет — вся запись целиком."""
+    inv = sale_inv(sale)
+    if inv is not None:
+        return f"inv:{inv}"
+    return "raw:" + json.dumps(sale, sort_keys=True, ensure_ascii=False)
 
 
 def format_order(sale, info):
     e = lambda v: html.escape(str(v)) if v not in (None, "") else "—"
     product = sale.get("product") or {}
     name = info.get("name") or product.get("name")
-    amount = info.get("amount") or product.get("price")
-    currency = info.get("currency_type") or product.get("currency") or ""
+    if info.get("amount"):
+        amount, currency = info["amount"], info.get("currency_type") or ""
+    else:
+        amount, currency = product.get("price_rub") or product.get("price"), "RUB"
     market = MARKETS.get(info.get("owner"), "Plati.market")
     buyer = info.get("buyer_info") or {}
 
@@ -91,7 +128,7 @@ def format_order(sale, info):
         "",
         f"📦 <b>Товар:</b> {e(name)}",
         f"💰 <b>Сумма:</b> {e(amount)} {e(currency)}",
-        f"🧾 <b>Заказ №:</b> <code>{e(sale.get('invoice_id'))}</code>",
+        f"🧾 <b>Заказ №:</b> <code>{e(sale_inv(sale))}</code>",
         f"🕒 <b>Дата:</b> {e(info.get('date_pay') or sale.get('date'))}",
     ]
     if info.get("cnt_goods") and float(info["cnt_goods"]) > 1:
@@ -116,7 +153,10 @@ def main():
     # чтобы после перезапуска на Railway не прилетели старые заказы.
     while True:
         try:
-            seen = {s["invoice_id"] for s in last_sales(50)}
+            start_sales = last_sales(50)
+            seen = {sale_key(s) for s in start_sales}
+            if start_sales:
+                log.info("Пример продажи из API: %s", start_sales[0])
             break
         except Exception as ex:
             log.error("Старт: %s", ex)
@@ -124,18 +164,39 @@ def main():
     log.info("Запущен, уже известно продаж: %d", len(seen))
     send_tg(f"✅ Бот заказов Plati запущен. Уже известно продаж: {len(seen)}")
 
+    # Проверка: если в Railway задать TEST_LAST_SALE=1, бот при старте
+    # пришлёт последнюю существующую продажу, чтобы было видно, как выглядит заявка.
+    if os.getenv("TEST_LAST_SALE") == "1":
+        try:
+            sales = last_sales(50)
+            if sales:
+                newest = max(sales, key=lambda s: str(s.get("date", "")))
+                inv = sale_inv(newest)
+                send_tg("🧪 ТЕСТ\n\n" + format_order(newest, purchase_info(inv) if inv else {}))
+        except Exception as ex:
+            log.error("Тест: %s", ex)
+
     while True:
         try:
             sales = last_sales()
             log.info("Проверка: продаж в ответе %d, новых %d",
-                     len(sales), sum(1 for s in sales if s.get("invoice_id") not in seen))
-            for sale in reversed(sales):  # от старых к новым
-                inv = sale.get("invoice_id")
-                if inv in seen:
+                     len(sales), sum(1 for s in sales if sale_key(s) not in seen))
+            for sale in sorted(sales, key=lambda s: str(s.get("date", ""))):  # от старых к новым
+                key = sale_key(sale)
+                if key in seen:
                     continue
-                seen.add(inv)
-                send_tg(format_order(sale, purchase_info(inv)))
-                log.info("Отправлен заказ %s", inv)
+                inv = sale_inv(sale)
+                log.info("Новый заказ %s: %s", inv, sale)
+                try:
+                    text = format_order(sale, purchase_info(inv) if inv else {})
+                except Exception as ex:
+                    log.error("Формат заказа %s: %s", inv, ex)
+                    text = f"🛒 <b>Новый заказ — Plati.market</b>\n🧾 Заказ №: <code>{inv}</code>"
+                # Помечаем заказ обработанным, только если Telegram его принял,
+                # иначе повторим на следующей проверке.
+                if send_tg(text):
+                    seen.add(key)
+                    log.info("Отправлен заказ %s", inv)
             if len(seen) > 5000:
                 seen = set(list(seen)[-1000:])
         except Exception as ex:
