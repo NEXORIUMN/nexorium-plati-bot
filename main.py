@@ -73,6 +73,8 @@ def send_tg(text):
                         "disable_web_page_preview": True}, timeout=20)
     if not r.ok:
         log.error("Telegram: %s", r.text)
+    else:
+        log.info("Telegram: сообщение отправлено")
 
 
 def format_order(sale, info):
@@ -120,10 +122,14 @@ def main():
             log.error("Старт: %s", ex)
             time.sleep(15)
     log.info("Запущен, уже известно продаж: %d", len(seen))
+    send_tg(f"✅ Бот заказов Plati запущен. Уже известно продаж: {len(seen)}")
 
     while True:
         try:
-            for sale in reversed(last_sales()):  # от старых к новым
+            sales = last_sales()
+            log.info("Проверка: продаж в ответе %d, новых %d",
+                     len(sales), sum(1 for s in sales if s.get("invoice_id") not in seen))
+            for sale in reversed(sales):  # от старых к новым
                 inv = sale.get("invoice_id")
                 if inv in seen:
                     continue
